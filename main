@@ -1,0 +1,348 @@
+import json
+import ssl
+import threading
+import time
+import os
+import importlib
+
+import paho.mqtt.client as mqtt
+import redis
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from random import randint
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import create_engine, text
+
+# ==================================================
+# TIMEZONE
+# ==================================================
+
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+# ==================================================
+# LOAD SYMBOL LIST
+# ==================================================
+
+SYMBOL_MODULE = "List.exchange"
+SYMBOL_NAME = "HOSE3"
+
+try:
+    module = importlib.import_module(SYMBOL_MODULE)
+    SYMBOLS = getattr(module, SYMBOL_NAME)
+except Exception as e:
+    raise RuntimeError(f"Không load được list {SYMBOL_MODULE}.{SYMBOL_NAME}: {e}")
+
+if not isinstance(SYMBOLS, (list, tuple)) or not SYMBOLS:
+    raise RuntimeError(f"SYMBOL_NAME {SYMBOL_NAME} không hợp lệ hoặc rỗng")
+
+print(f"Loaded {len(SYMBOLS)} symbols from {SYMBOL_MODULE}.{SYMBOL_NAME}")
+
+# ==================================================
+# DERIVE EXCHANGE NAME
+# ==================================================
+
+if SYMBOL_NAME.startswith("HNX"):
+    EXCHANGE = "HNX"
+elif SYMBOL_NAME.startswith("HOSE"):
+    EXCHANGE = "HOSE"
+elif SYMBOL_NAME.startswith("UPCOM"):
+    EXCHANGE = "UPCOM"
+else:
+    EXCHANGE = "DERIVATIVES"
+
+# ==================================================
+# CONFIG - EDIT THESE VALUES
+# ==================================================
+
+USERNAME = "YOUR_DNSE_USERNAME"
+PASSWORD = "YOUR_DNSE_PASSWORD"
+
+DB_URL = "postgresql://user:password@host:port/database"
+DB_SCHEMA = "ohlcv"
+
+REDIS_URL = "redis://default:password@host:port/0"
+
+# Resolution options:
+# "1"   = 1 minute
+# "3"   = 3 minutes
+# "15"  = 15 minutes
+# "30"  = 30 minutes
+# "45"  = 45 minutes
+# "1H"  = 1 hour
+# "1D"  = 1 day
+RESOLUTION = "1D"
+
+# Auto-generate channel and table suffix from resolution
+REDIS_CHANNEL = f"ohlcv_{RESOLUTION.lower()}"
+
+# ==================================================
+# RESOLUTION CONFIG MAPPING
+# ==================================================
+
+RESOLUTION_CONFIG = {
+    "1":  {"table_suffix": "_1M",  "redis_function": "chart_1m"},
+    "3":  {"table_suffix": "_3M",  "redis_function": "chart_3m"},
+    "15": {"table_suffix": "_15M", "redis_function": "chart_15m"},
+    "30": {"table_suffix": "_30M", "redis_function": "chart_30m"},
+    "45": {"table_suffix": "_45M", "redis_function": "chart_45m"},
+    "1H": {"table_suffix": "_1H",  "redis_function": "chart_1h"},
+    "1D": {"table_suffix": "_1D",  "redis_function": "chart_1d"},
+}
+
+if RESOLUTION not in RESOLUTION_CONFIG:
+    raise RuntimeError(f"RESOLUTION không hợp lệ. Chọn: {list(RESOLUTION_CONFIG.keys())}")
+
+RES_CONFIG = RESOLUTION_CONFIG[RESOLUTION]
+
+# ==================================================
+# HTTP SESSION
+# ==================================================
+
+http = Session()
+
+retry = Retry(
+    total=3,
+    backoff_factor=0.3,
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+
+adapter = HTTPAdapter(
+    pool_connections=5,
+    pool_maxsize=5,
+    max_retries=retry
+)
+
+http.mount("https://", adapter)
+http.mount("http://", adapter)
+
+# ==================================================
+# POSTGRES
+# ==================================================
+
+engine = create_engine(
+    DB_URL,
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=20,
+    pool_recycle=1800,
+    pool_pre_ping=True
+)
+
+# ==================================================
+# REDIS
+# ==================================================
+
+redis_pool = redis.ConnectionPool.from_url(
+    REDIS_URL,
+    max_connections=30,
+    decode_responses=False
+)
+
+redis_client = redis.Redis(connection_pool=redis_pool)
+
+redis_client.ping()
+print("Connected Redis")
+
+# ==================================================
+# TRADING TIME (VIETNAM TIME)
+# ==================================================
+
+def is_trading_time_vn():
+    now = datetime.now(VN_TZ)
+    hm = now.hour + now.minute / 60
+
+    if (
+        hm < 9 or
+        11.5 <= hm < 13 or
+        hm > 14.75
+    ):
+        return False
+    return True
+
+# ==================================================
+# UPSERT OHLCV (DYNAMIC RESOLUTION)
+# ==================================================
+
+def upsert_ohlcv(symbol, data):
+    try:
+        ts = int(data.get("time") or data.get("timestamp"))
+
+        if ts > 10000000000:
+            ts = ts / 1000
+
+        time_vn = datetime.fromtimestamp(ts)
+        time_vn = time_vn.replace(tzinfo=VN_TZ)
+
+        # For 1D candles, set time to market close (15:00:00)
+        # For intraday candles, keep the actual timestamp
+        if RESOLUTION == "1D":
+            time_vn = time_vn.replace(hour=15, minute=0, second=0, microsecond=0)
+
+        time_vn_str = time_vn.strftime("%Y-%m-%d %H:%M:%S")
+
+        table = f'"{SCHEMA}"."{symbol.upper()}{RES_CONFIG["table_suffix"]}"'
+
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}";'))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    symbol TEXT,
+                    time TIMESTAMP WITH TIME ZONE,
+                    open DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    volume BIGINT,
+                    PRIMARY KEY (symbol, time)
+                );
+            """))
+
+            conn.execute(text(f"""
+                INSERT INTO {table}
+                (symbol, time, open, close, high, low, volume)
+                VALUES
+                (:symbol, :time, :open, :close, :high, :low, :volume)
+                ON CONFLICT (symbol, time) DO UPDATE SET
+                    open = EXCLUDED.open,
+                    close = EXCLUDED.close,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    volume = EXCLUDED.volume;
+            """), {
+                "symbol": symbol.upper(),
+                "time": time_vn,
+                "open": float(data.get("open", 0)),
+                "close": float(data.get("close", 0)),
+                "high": float(data.get("high", 0)),
+                "low": float(data.get("low", 0)),
+                "volume": int(data.get("volume", 0)),
+            })
+
+        print(f"[{RESOLUTION}] {symbol} @ {time_vn_str} VN")
+
+    except Exception as e:
+        print(f"DB error {symbol}: {e}")
+
+# ==================================================
+# AUTH DNSE
+# ==================================================
+
+def authenticate(username, password):
+    r = http.post(
+        "https://api.dnse.com.vn/user-service/api/auth",
+        json={"username": username, "password": password},
+        timeout=10
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+def get_investor_id(token):
+    r = http.get(
+        "https://api.dnse.com.vn/user-service/api/me",
+        headers={"authorization": f"Bearer {token}"},
+        timeout=10
+    )
+    r.raise_for_status()
+    return r.json()["investorId"]
+
+token = authenticate(USERNAME, PASSWORD)
+investor_id = get_investor_id(token)
+
+# ==================================================
+# MQTT
+# ==================================================
+
+client = mqtt.Client(
+    client_id=f"dnse-ohlc-{RESOLUTION.lower()}-{randint(1000,9999)}",
+    protocol=mqtt.MQTTv311,
+    transport="websockets",
+    clean_session=True
+)
+
+client.username_pw_set(investor_id, token)
+
+client.tls_set(cert_reqs=ssl.CERT_NONE)
+client.tls_insecure_set(True)
+client.ws_set_options(path="/wss")
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print("Connected MQTT")
+        for sym in SYMBOLS:
+            client.subscribe(
+                f"plaintext/quotes/krx/mdds/v2/ohlc/stock/{RESOLUTION}/{sym}",
+                qos=1
+            )
+    else:
+        print("MQTT connect failed", rc)
+
+def on_message(client, userdata, msg):
+    try:
+        data = json.loads(msg.payload.decode())
+        symbol = data.get("symbol")
+
+        if not symbol or not is_trading_time_vn():
+            return
+
+        upsert_ohlcv(symbol, data)
+
+        ts = int(data["time"])
+
+        if ts > 10000000000:
+            ts = ts / 1000
+
+        time_vn = datetime.fromtimestamp(ts)
+        time_vn = time_vn.replace(tzinfo=VN_TZ)
+
+        if RESOLUTION == "1D":
+            time_vn = time_vn.replace(hour=15, minute=0, second=0, microsecond=0)
+
+        time_vn_str = time_vn.strftime("%Y-%m-%d %H:%M:%S")
+
+        redis_client.publish(
+            REDIS_CHANNEL,
+            json.dumps({
+                "function": RES_CONFIG["redis_function"],
+                "symbol": symbol.upper(),
+                "time": time_vn_str,
+                "open": float(data.get("open", 0)),
+                "close": float(data.get("close", 0)),
+                "high": float(data.get("high", 0)),
+                "low": float(data.get("low", 0)),
+                "volume": float(data.get("volume", 0)),
+                "exchange": EXCHANGE
+            })
+        )
+    except Exception as e:
+        print("on_message error:", e)
+
+client.on_connect = on_connect
+client.on_message = on_message
+
+# ==================================================
+# REDIS SUB TEST
+# ==================================================
+
+def redis_subscriber_test():
+    sub = redis_client.pubsub()
+    sub.subscribe(REDIS_CHANNEL)
+    for msg in sub.listen():
+        if msg["type"] == "message":
+            print("Redis:", msg["data"].decode())
+
+threading.Thread(target=redis_subscriber_test, daemon=True).start()
+
+# ==================================================
+# START
+# ==================================================
+
+client.connect_async("datafeed-lts-krx.dnse.com.vn", 443, keepalive=60)
+client.loop_start()
+
+while True:
+    time.sleep(1)
